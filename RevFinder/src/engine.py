@@ -25,6 +25,23 @@ COMPARE_FIELDS = [
     "vendor",
     "price",
 ]
+DESCRIPTOR_TAIL_WORDS = {
+    "red",
+    "green",
+    "blue",
+    "black",
+    "white",
+    "yellow",
+    "coil",
+    "curve",
+    "output",
+    "input",
+    "momentary",
+    "maintained",
+    "normally open",
+    "normally closed",
+}
+VALID_UNITS = {"ea", "each", "pc", "pcs", "piece", "pieces", "ft", "in", "mm", "m", "set", "lot", "box", "roll"}
 
 
 @dataclass
@@ -52,6 +69,7 @@ class DiffResult:
     old_items: pd.DataFrame
     new_items: pd.DataFrame
     comparison: pd.DataFrame
+    document_changes: pd.DataFrame
     summary: dict[str, int]
 
 
@@ -101,6 +119,8 @@ def compare_documents(old_document: ParsedDocument, new_document: ParsedDocument
         "modified": sum(change.status == "modified" for change in changes),
         "unchanged": sum(change.status == "unchanged" for change in changes),
     }
+    document_changes = _document_changes_dataframe(old_document, new_document)
+    summary["document_changes"] = int(len(document_changes))
 
     return DiffResult(
         old_document=old_document,
@@ -109,11 +129,14 @@ def compare_documents(old_document: ParsedDocument, new_document: ParsedDocument
         old_items=old_df,
         new_items=new_df,
         comparison=_comparison_dataframe(changes),
+        document_changes=document_changes,
         summary=summary,
     )
 
 
 def filter_changes(diff: DiffResult, status: str) -> pd.DataFrame:
+    if diff.comparison.empty or "status" not in diff.comparison.columns:
+        return pd.DataFrame(columns=_comparison_columns())
     return diff.comparison[diff.comparison["status"] == status].copy()
 
 
@@ -157,12 +180,25 @@ def discrepancy_log(diff: DiffResult) -> pd.DataFrame:
                         "message": f"{field_change.field} changed.",
                     }
                 )
+    for _, change in diff.document_changes.iterrows():
+        rows.append(
+            {
+                "severity": "high" if change["field"] in {"revision", "release_date", "notes"} else "medium",
+                "status": "document_changed",
+                "match_key": "document",
+                "field": change["field"],
+                "old_value": change["old_value"],
+                "new_value": change["new_value"],
+                "message": f"Document-level {change['field']} changed.",
+            }
+        )
     return pd.DataFrame(rows)
 
 
 def _items_to_dataframe(document: ParsedDocument) -> pd.DataFrame:
     rows = []
     for index, item in enumerate(document.line_items, start=1):
+        item = _repair_shifted_descriptor_tail(item)
         row = {field: _display(item.get(field)) for field in LINE_ITEM_FIELDS}
         row["_row_number"] = index
         row["_source_name"] = document.source_name
@@ -216,7 +252,55 @@ def _comparison_dataframe(changes: list[RowChange]) -> pd.DataFrame:
                 "similarity": round(float(change.similarity), 4),
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=_comparison_columns())
+
+
+def _comparison_columns() -> list[str]:
+    return [
+        "status",
+        "match_key",
+        "part_number_old",
+        "part_number_new",
+        "description_old",
+        "description_new",
+        "quantity_old",
+        "quantity_new",
+        "revision_old",
+        "revision_new",
+        "changed_fields",
+        "similarity",
+    ]
+
+
+def _document_changes_dataframe(old_document: ParsedDocument, new_document: ParsedDocument) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    header_keys = sorted(set(old_document.header) | set(new_document.header))
+    for key in header_keys:
+        old_value = _display(old_document.header.get(key))
+        new_value = _display(new_document.header.get(key))
+        if _normalize_text(old_value) != _normalize_text(new_value):
+            rows.append(
+                {
+                    "section": "header",
+                    "field": key,
+                    "old_value": old_value,
+                    "new_value": new_value,
+                }
+            )
+
+    old_notes = _normalize_notes(old_document.notes)
+    new_notes = _normalize_notes(new_document.notes)
+    if old_notes != new_notes:
+        rows.append(
+            {
+                "section": "notes",
+                "field": "notes",
+                "old_value": "\n".join(old_document.notes),
+                "new_value": "\n".join(new_document.notes),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=["section", "field", "old_value", "new_value"])
 
 
 def _values_equal(old_value: Any, new_value: Any, numeric: bool = False) -> bool:
@@ -255,6 +339,32 @@ def _normalize_identifier(value: Any) -> str:
 
 def _normalize_text(value: Any) -> str:
     return " ".join(_display(value).casefold().split())
+
+
+def _normalize_notes(notes: list[str]) -> str:
+    return "\n".join(_normalize_text(note) for note in notes if _normalize_text(note))
+
+
+def _repair_shifted_descriptor_tail(item: dict[str, Any]) -> dict[str, Any]:
+    repaired = dict(item)
+    description = _display(repaired.get("description"))
+    for field in ("vendor", "unit"):
+        value = _display(repaired.get(field))
+        if not value:
+            continue
+        normalized = re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+        if field == "unit" and normalized in VALID_UNITS:
+            continue
+        if normalized not in DESCRIPTOR_TAIL_WORDS and not re.search(
+            r"\b(?:\d+\s*(?:v|vac|vdc|a|amp|amps)|c\s*curve|coil|output|input|red|green|blue|black|white|yellow)\b",
+            normalized,
+        ):
+            continue
+        if value.casefold() not in description.casefold():
+            description = f"{description} {value}".strip()
+        repaired[field] = ""
+    repaired["description"] = description
+    return repaired
 
 
 def _display(value: Any) -> str:

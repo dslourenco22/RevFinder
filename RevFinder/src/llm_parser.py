@@ -10,11 +10,43 @@ from urllib.parse import urlparse
 
 import requests
 
-from .extractor import PdfExtraction, flatten_tables
+from .extractor import HEADER_BAND_POINTS, PdfExtraction, flatten_tables, page_body_text
 
 
 DEFAULT_MODEL = "llama3.2"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DESCRIPTOR_TAIL_WORDS = {
+    "red",
+    "green",
+    "blue",
+    "black",
+    "white",
+    "yellow",
+    "coil",
+    "curve",
+    "output",
+    "input",
+    "momentary",
+    "maintained",
+    "normally open",
+    "normally closed",
+}
+VALID_UNITS = {
+    "ea",
+    "each",
+    "pc",
+    "pcs",
+    "piece",
+    "pieces",
+    "ft",
+    "in",
+    "mm",
+    "m",
+    "set",
+    "lot",
+    "box",
+    "roll",
+}
 
 LINE_ITEM_FIELDS = [
     "item_id",
@@ -55,11 +87,13 @@ class LocalOllamaParser:
         model: str = DEFAULT_MODEL,
         timeout_seconds: int = 180,
         max_prompt_chars: int = 52_000,
+        header_band_points: float = HEADER_BAND_POINTS,
     ) -> None:
         self.base_url = _validate_local_url(base_url).rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.max_prompt_chars = max_prompt_chars
+        self.header_band_points = header_band_points
 
     def parse(self, extraction: PdfExtraction) -> ParsedDocument:
         payload = {
@@ -83,10 +117,13 @@ class LocalOllamaParser:
             response.raise_for_status()
             parsed = _decode_ollama_response(response.json(), extraction.source_name)
             parsed.parser = f"ollama:{self.model}"
+            # Notes are derived deterministically (coordinate-bounded + keyword
+            # anchored) so the model cannot fallback-scrape header metadata.
+            parsed.notes = extract_document_notes(extraction, self.header_band_points)
             parsed.warnings.extend(extraction.warnings)
             return _normalize_parsed_document(parsed)
         except Exception as exc:
-            fallback = fallback_parse(extraction)
+            fallback = fallback_parse(extraction, self.header_band_points)
             fallback.warnings.append(f"Ollama parse unavailable; used deterministic fallback: {exc}")
             return fallback
 
@@ -145,6 +182,8 @@ Rules:
 - Preserve engineering identifiers, decimals, dash suffixes, and revision letters exactly.
 - Use source_page when it can be inferred.
 - Confidence must be a number from 0 to 1.
+- Only put text that appears under an explicit heading such as "Revision Change Engineering Notes", "Engineering Change Notes", or "Revision History" in notes. Never put the company name, page header, or document metadata fields in notes.
+- If a table description wraps to multiple visual lines, merge the wrapped text back into description. Do not put words like color names, Coil, Curve, Input, or Output in vendor/unit unless the source explicitly labels them there.
 
 Source file: {extraction.source_name}
 
@@ -156,14 +195,17 @@ Extracted page text:
 """.strip()
 
 
-def fallback_parse(extraction: PdfExtraction) -> ParsedDocument:
+def fallback_parse(
+    extraction: PdfExtraction, header_band_points: float = HEADER_BAND_POINTS
+) -> ParsedDocument:
     """Best-effort deterministic parser for table-shaped engineering documents."""
 
     items: list[dict[str, Any]] = []
     for table in extraction.tables:
         if not table.rows:
             continue
-        header_index, header = _find_header_row(table.rows)
+        rows = _coalesce_wrapped_rows(table.rows)
+        header_index, header = _find_header_row(rows)
         if header_index is None:
             continue
 
@@ -171,11 +213,12 @@ def fallback_parse(extraction: PdfExtraction) -> ParsedDocument:
         if not column_map:
             continue
 
-        for raw_row in table.rows[header_index + 1 :]:
+        for raw_row in rows[header_index + 1 :]:
             row = [str(cell or "").strip() for cell in raw_row]
             if not any(row):
                 continue
             item = _row_to_item(row, column_map)
+            item = _repair_shifted_descriptor_tail(item)
             item["source_page"] = table.page_number
             item["raw_text"] = " | ".join(cell for cell in row if cell)
             item["confidence"] = 0.55
@@ -191,6 +234,7 @@ def fallback_parse(extraction: PdfExtraction) -> ParsedDocument:
             document_type=_guess_document_type(extraction.full_text),
             header=_extract_header_hints(extraction.full_text),
             line_items=items,
+            notes=extract_document_notes(extraction, header_band_points),
             parser="deterministic-fallback",
             warnings=list(extraction.warnings),
         )
@@ -235,6 +279,7 @@ def _normalize_parsed_document(document: ParsedDocument) -> ParsedDocument:
     for item in document.line_items:
         if not isinstance(item, dict):
             continue
+        item = _repair_shifted_descriptor_tail(item)
         normalized = {field: _clean_value(item.get(field, "")) for field in LINE_ITEM_FIELDS}
         normalized["confidence"] = _coerce_confidence(item.get("confidence"))
         if any(normalized.get(field) for field in ("item_id", "part_number", "description", "raw_text")):
@@ -243,7 +288,7 @@ def _normalize_parsed_document(document: ParsedDocument) -> ParsedDocument:
     document.line_items = normalized_items
     document.document_type = document.document_type or "unknown"
     document.header = {str(k): _clean_value(v) for k, v in document.header.items()}
-    document.notes = [_clean_value(note) for note in document.notes if _clean_value(note)]
+    document.notes = [cleaned for note in document.notes if (cleaned := _clean_note(note))]
     return document
 
 
@@ -271,6 +316,40 @@ def _find_header_row(rows: tuple[tuple[str, ...], ...]) -> tuple[int | None, tup
         if score >= 2:
             return index, row
     return None, ()
+
+
+def _coalesce_wrapped_rows(rows: tuple[tuple[str, ...], ...]) -> tuple[tuple[str, ...], ...]:
+    """Merge continuation rows created by wrapped table-cell text."""
+
+    if not rows:
+        return rows
+
+    header_index, header = _find_header_row(rows)
+    if header_index is None:
+        return rows
+    column_map = _map_columns(header)
+    description_index = column_map.get("description", min(2, len(header) - 1))
+    key_indexes = [
+        index
+        for field in ("item_id", "part_number", "quantity")
+        if (index := column_map.get(field)) is not None
+    ]
+
+    merged: list[list[str]] = [list(row) for row in rows[: header_index + 1]]
+    for raw_row in rows[header_index + 1 :]:
+        row = [str(cell or "").strip() for cell in raw_row]
+        if not any(row):
+            continue
+        has_key = any(index < len(row) and row[index] for index in key_indexes)
+        if not has_key and len(merged) > header_index + 1:
+            continuation = " ".join(cell for cell in row if cell)
+            while len(merged[-1]) <= description_index:
+                merged[-1].append("")
+            merged[-1][description_index] = f"{merged[-1][description_index]} {continuation}".strip()
+            continue
+        merged.append(row)
+
+    return tuple(tuple(row) for row in merged)
 
 
 def _map_columns(header: tuple[str, ...]) -> dict[str, int]:
@@ -304,6 +383,41 @@ def _row_to_item(row: list[str], column_map: dict[str, int]) -> dict[str, Any]:
         if index < len(row):
             item[field] = row[index]
     return item
+
+
+def _repair_shifted_descriptor_tail(item: dict[str, Any]) -> dict[str, Any]:
+    """Move obvious wrapped-description tails out of vendor/unit fields."""
+
+    repaired = dict(item)
+    description = _clean_value(repaired.get("description"))
+    for field in ("vendor", "unit"):
+        value = _clean_value(repaired.get(field))
+        if not value:
+            continue
+        if field == "unit" and _normalize_token(value) in VALID_UNITS:
+            continue
+        if field == "vendor" and not _looks_like_description_tail(value):
+            continue
+        if field == "unit" and not _looks_like_description_tail(value):
+            continue
+        if value.casefold() not in description.casefold():
+            description = f"{description} {value}".strip()
+        repaired[field] = ""
+
+    repaired["description"] = description
+    return repaired
+
+
+def _looks_like_description_tail(value: str) -> bool:
+    normalized = _normalize_token(value)
+    if normalized in DESCRIPTOR_TAIL_WORDS:
+        return True
+    return bool(
+        re.search(
+            r"\b(?:\d+\s*(?:v|vac|vdc|a|amp|amps)|c\s*curve|coil|output|input|red|green|blue|black|white|yellow)\b",
+            normalized,
+        )
+    )
 
 
 def _line_scan_parse(extraction: PdfExtraction) -> list[dict[str, Any]]:
@@ -354,8 +468,10 @@ def _extract_header_hints(text: str) -> dict[str, str]:
     hints: dict[str, str] = {}
     patterns = {
         "document_number": r"(?:document|doc|po|bom|eco)\s*(?:number|no\.?|#)\s*[:\-]?\s*([A-Z0-9._\-]+)",
-        "revision": r"(?:revision|rev)\s*[:\-]?\s*([A-Z0-9._\-]+)",
-        "date": r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})\b",
+        "revision": r"(?:document\s*)?(?:revision|rev)\s*[:#\-]?\s*([A-Z0-9._\-]+)",
+        "release_date": r"(?:release|released|effective)?\s*date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|[A-Z][a-z]+\s+\d{1,2},?\s+\d{4})",
+        "date": r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|[A-Z][a-z]+\s+\d{1,2},?\s+\d{4})\b",
+        "title": r"(?:title|description)\s*[:\-]\s*(.{4,120})",
     }
     for key, pattern in patterns.items():
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -364,8 +480,77 @@ def _extract_header_hints(text: str) -> dict[str, str]:
     return hints
 
 
+# A notes block is only recognised when it is introduced by an explicit heading.
+# Without an anchor we return nothing rather than fallback-scraping page header
+# metadata as "generic document text".
+_NOTE_HEADING = re.compile(
+    r"(?i)\b(?:revision\s+change\s+engineering\s+notes"
+    r"|engineering\s+change\s+notes"
+    r"|revision\s+history"
+    r"|change\s+(?:summary|log|notes))\b\s*[:\-]?"
+)
+# Lines that mark the end of a notes block (footer, signatures, header fields
+# that may sit below the notes box, or page chrome).
+_NOTE_STOP = re.compile(
+    r"(?i)^(?:approved\s+by|prepared\s+by|checked\s+by|reviewed\s+by|signature"
+    r"|page\s+\d+\s+of\s+\d+|printed\s+(?:on|by)|confidential"
+    r"|document\s+type\s*:|system\s+id\s*:|project\s+name\s*:|status\s*:)"
+)
+
+
+def extract_document_notes(
+    extraction: PdfExtraction, header_band_points: float = HEADER_BAND_POINTS
+) -> list[str]:
+    """Extract engineering/revision note blocks deterministically.
+
+    Coordinate bounding excludes the top ``header_band_points`` of each page, and a
+    keyword anchor (:data:`_NOTE_HEADING`) is required before any text is captured.
+    If no page contains the anchor, an empty list is returned instead of unmapped
+    text.
+    """
+
+    notes: list[str] = []
+    for page in extraction.pages:
+        body = page_body_text(page, top_margin=header_band_points)
+        if not body:
+            continue
+        match = _NOTE_HEADING.search(body)
+        if not match:
+            continue
+        block = _capture_note_block(body[match.start() :])
+        if block and block not in notes:
+            notes.append(block)
+    return notes
+
+
+def _capture_note_block(segment: str, max_lines: int = 40) -> str:
+    collected: list[str] = []
+    for raw_line in segment.splitlines():
+        line = _clean_value(raw_line)
+        if not line:
+            continue
+        if collected and _NOTE_STOP.search(line):
+            break
+        collected.append(line)
+        if len(collected) >= max_lines:
+            break
+    return "\n".join(collected)
+
+
 def _clean_value(value: Any) -> str:
     return " ".join(str(value or "").replace("\x00", "").split())
+
+
+def _clean_note(value: Any) -> str:
+    """Clean a note while preserving line breaks for display and diffing."""
+
+    text = str(value or "").replace("\x00", "")
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _normalize_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _clean_value(value).casefold()).strip()
 
 
 def _coerce_confidence(value: Any) -> float:

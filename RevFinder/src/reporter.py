@@ -25,6 +25,7 @@ def build_excel_report(diff: DiffResult) -> BytesIO:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         _summary_dataframe(diff).to_excel(writer, index=False, sheet_name="Summary")
+        diff.document_changes.to_excel(writer, index=False, sheet_name="Document Changes")
         diff.comparison.to_excel(writer, index=False, sheet_name="All Changes")
         filter_changes(diff, "added").to_excel(writer, index=False, sheet_name="Added")
         filter_changes(diff, "removed").to_excel(writer, index=False, sheet_name="Removed")
@@ -57,6 +58,7 @@ def _summary_dataframe(diff: DiffResult) -> pd.DataFrame:
         ("Removed", diff.summary["removed"]),
         ("Modified", diff.summary["modified"]),
         ("Unchanged", diff.summary["unchanged"]),
+        ("Document changes", diff.summary.get("document_changes", 0)),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Value"])
 
