@@ -28,7 +28,7 @@ RevFinder/
 
 ## Setup
 
-Install Python 3.10 or newer, then create a virtual environment:
+Install Python 3.9 or newer, then create a virtual environment:
 
 ```bash
 cd /opt/RevFinder
@@ -60,6 +60,24 @@ Open:
 ```text
 http://SERVER_HOSTNAME_OR_IP:8502
 ```
+
+`requirements.txt` is runtime-only. The model can be switched in the sidebar
+(`llama3.2`, `llama3.1:8b`, `qwen2.5:7b`, `llama3.2:1b`); pull any you select with
+`ollama pull <model>`. Stronger models map unusual layouts more reliably.
+
+## Testing
+
+```bash
+cd RevFinder
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+The suite (`tests/test_revfinder.py`) covers extraction, reconciliation (relational
+full outer join with prefix- and content-based key healing), price/quantity
+normalization and recovery, severity-coded highlight generation, and the
+pipe-delimited log format. CI runs it on every push via `.github/workflows/ci.yml`.
 
 ## systemd Deployment
 

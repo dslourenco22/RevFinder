@@ -1,4 +1,15 @@
+# OMNI Control Technology — RevFinder
+# Corporate brand + LAN deployment configuration.
+
+[theme]
+primaryColor = "#1E50E0"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FB"
+textColor = "#0F1B33"
+font = "sans serif"
+
 [server]
+maxUploadSize = 50
 address = "0.0.0.0"
 port = 8502
 headless = true

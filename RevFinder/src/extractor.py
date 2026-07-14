@@ -284,6 +284,18 @@ def _extract_word_grid_tables(page: pdfplumber.page.Page, page_number: int, warn
 
         if not any(row):
             continue
+        # Spatial suffix stitch: a lone part-column token sitting beneath a
+        # hyphen-terminated part number is a wrapped IPN suffix, not a new row.
+        part_index = _header_index(headers, "part_number")
+        if (
+            part_index is not None
+            and len(rows) > 1
+            and row[part_index]
+            and rows[-1][part_index].endswith("-")
+            and _only_column_filled(row, part_index)
+        ):
+            rows[-1][part_index] = f"{rows[-1][part_index]}{row[part_index]}".strip()
+            continue
         if _is_continuation_row(row, headers) and len(rows) > 1:
             description_index = _header_index(headers, "description")
             target_index = description_index if description_index is not None else min(2, len(headers) - 1)
@@ -361,7 +373,11 @@ def _canonical_header_label(text: str) -> str:
     label = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
     if label in {"item", "item no", "line", "line no", "no"}:
         return "item_id"
-    if label in {"part", "part no", "part number", "pn", "p n"}:
+    if label in {"mpn", "mfg part", "mfg pn", "manufacturer part", "manufacturer part number"}:
+        return "mpn"
+    if label in {"manufacturer", "mfg", "mfr"}:
+        return "manufacturer"
+    if label in {"part", "part no", "part number", "pn", "p n", "ipn"}:
         return "part_number"
     if label in {"description", "desc", "item description"}:
         return "description"
@@ -371,12 +387,12 @@ def _canonical_header_label(text: str) -> str:
         return "unit"
     if label in {"rev", "revision"}:
         return "revision"
-    if label in {"manufacturer", "mfg"}:
-        return "manufacturer"
     if label in {"vendor", "supplier"}:
         return "vendor"
-    if label in {"price", "unit price", "cost", "unit cost"}:
-        return "price"
+    if label in {"ext price", "extended", "extended price", "line total", "total", "total price", "total line val"}:
+        return "total_price"
+    if label in {"price", "unit price", "cost", "unit cost", "price per unit"}:
+        return "unit_price"
     return ""
 
 
@@ -410,6 +426,12 @@ def _header_index(headers: list[dict[str, float | str]], label: str) -> int | No
         if header["label"] == label:
             return index
     return None
+
+
+def _only_column_filled(row: list[str], index: int) -> bool:
+    """True when ``row`` has content only in column ``index`` (all others empty)."""
+
+    return any(row) and all(cell == "" for position, cell in enumerate(row) if position != index)
 
 
 def _clean_cell(value: object) -> str:
