@@ -79,7 +79,52 @@ full outer join with prefix- and content-based key healing), price/quantity
 normalization and recovery, severity-coded highlight generation, and the
 pipe-delimited log format. CI runs it on every push via `.github/workflows/ci.yml`.
 
-## systemd Deployment
+## Windows LAN Deployment (host on a Windows "server")
+
+RevFinder runs great on a Windows laptop/desktop that stays on the LAN. Ollama is
+**optional** — structured PO/BoM/Excel/CSV documents are parsed by the built-in
+deterministic engine, so you only need Ollama for unusual PDF layouts.
+
+1. **Install Python** 3.9+ from <https://www.python.org/downloads/> — during setup
+   check **"Add python.exe to PATH"**.
+
+2. **Copy the app folder** (the `RevFinder` directory containing `app.py`,
+   `requirements.txt`, `src/`, `.streamlit/`) to the Windows machine, e.g.
+   `C:\RevFinder`. Do not copy the `.venv` folder — it is recreated on first run.
+   (Or `git clone` the repo if you use one.)
+
+3. **Run it** — double-click `run.bat` (or from a command prompt: `run.bat`). The
+   first run creates a virtual environment and installs dependencies, then serves
+   on port `8502`.
+
+4. **Open the Windows Firewall** for the port (one-time, in an **Administrator**
+   command prompt):
+
+   ```bat
+   netsh advfirewall firewall add rule name="RevFinder 8502" dir=in action=allow protocol=TCP localport=8502
+   ```
+
+5. **Find the machine's IP** with `ipconfig` (the IPv4 Address). Team members open:
+
+   ```text
+   http://THAT-IP:8502
+   ```
+
+### Auto-start on boot (keep it always running)
+
+Easiest — **Task Scheduler**:
+
+1. Open *Task Scheduler* → *Create Task*.
+2. General: *Run whether user is logged on or not*, *Run with highest privileges*.
+3. Triggers: *At startup*.
+4. Actions: *Start a program* → Program/script: `C:\RevFinder\run.bat` (Start in:
+   `C:\RevFinder`).
+5. Save. It now launches on boot and restarts with the machine.
+
+More robust (auto-restart on crash) — install [NSSM](https://nssm.cc/) and register
+`run.bat` (or the venv `streamlit.exe`) as a Windows service.
+
+## systemd Deployment (Linux)
 
 Create `/etc/systemd/system/revfinder.service`:
 
